@@ -1,0 +1,1733 @@
+ec2.tf
+data "aws_ssm_parameter" "windows-sg" {
+  name = "/terraform/${var.vpc_group}/${var.vpc_tier}/windows"
+}
+/*
+ * EC2 instance to deploy.
+ */
+resource "aws_instance" "ec2" {
+  ami                     = var.is_dr ? data.aws_ami.dr_ami[0].id : (local.query_ami_id ? var.ami_name : data.aws_ami.name_filter[0].id)
+  instance_type           = var.instance_type
+  iam_instance_profile    = var.ec2_create_role || var.ec2_cert_required ? aws_iam_instance_profile.ec2_profile[0].name : "EC2SSMDefault"
+  disable_api_termination = var.enable_termination_protection
+  key_name                = var.vendor_ami_owner != "" ? var.key_pair_name : null
+  tags                    = var.tags              
+  #NOTE: Subnet_id and Security_groups arguments are added to handle the scenarios for ec2 running on version below 5.0.5(Bug fix AWS-11411) upgrading to v5,v5.0 and to/above v5.0.5
+  subnet_id              = local.subnet_ids
+  vpc_security_group_ids = local.security_group_ids
+  metadata_options {
+    http_endpoint           = "enabled"
+    http_tokens             = "required"
+  }
+  #Network Interface attachment with ec2, dynamic block for NIC, it will execute for ec2 module version for/above v5.0.5 (Default cases)
+  dynamic "network_interface" {
+    for_each = var.current_ec2_solution_version == "" ? [1] : []
+    content {
+      network_interface_id = aws_network_interface.secondary_ips[0].id
+      device_index         = 0
+    }
+  }
+
+  # NOTE: Conflicts w/ workaround below.
+  #volume_tags = merge(var.tags, { MountPoint = "OS", Name = "${local.ec2_name}-ebs" })
+
+  # EC2 init scripts.
+  #  user_data = data.template_cloudinit_config.init_ec2.rendered
+  user_data_base64 = var.vendor_ami_owner == "" ? base64encode(data.template_file.user_data.rendered) : null
+
+  monitoring = true
+
+  # Ignore the following changes since initial deployment...
+  lifecycle {
+    ignore_changes = [
+      user_data_base64,     # user_data modifications
+      ebs_optimized,        # instance type change (e.g., m5.large -> c5.xlarge)
+      tags["Hostname"],     # tag ignored as its value is generated after ec2 creation and the tag must be applied as a resource below
+      tags["RegionalDNS"],  # tag ignored as its value is generated after ec2 creation and the tag must be applied as a resource below
+      tags["GlobalDNS"],    # tag ignored as its value is generated after ec2 creation and the tag must be applied as a resource below
+      tags["ec2_cert_arn"], # tag ignored as its value is generated after ec2 creation and the tag must be applied as a resource below
+      tags["Name"],
+      tags["Platform"],
+      tags["BackupPlan"],
+      tags["BackupName"],
+      tags["BackupPolicyOS"],
+      tags["AmiVendor"],
+      tags["PatchAZ"],
+      tags["AnsibleEnvironment"],
+      tags["AnsibleRoles"],
+      tags["AnsibleClusters"]
+    ]
+  }
+
+  dynamic "root_block_device" {
+    for_each = var.kms_key_arn == null && var.root_volume_size == null ? [] : [1]
+    content {
+      encrypted   = true
+      kms_key_id  = var.kms_key_arn
+      volume_size = var.root_volume_size
+    }
+  }
+}
+
+/*
+ * AMI name filter.
+ */
+data "aws_ami" "name_filter" {
+  count       = local.query_ami_id || var.is_dr ? 0 : 1
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = [var.ami_name]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  owners = [local.base_ami_owner]
+}
+
+
+/*
+ * Disaster Recovery AMI
+ * For information about these tags, see the following documentation: https://alightsolutionsllc.sharepoint.com/sites/CloudTransform/Wiki/Landing%20Zone/Landing%20Zone%20Tagging%20Design.aspx
+ */
+data "aws_ami" "dr_ami" {
+  count       = var.is_dr ? 1 : 0
+  most_recent = true
+  owners = [
+  "self"]
+
+  filter {
+    name = "tag:BackupPlan"
+    values = [
+    var.backup_plan]
+  }
+
+  filter {
+    name = "tag:BackupName"
+    values = [
+    var.backup_name]
+  }
+}
+
+cert.tf
+module "private_cert" {
+  count             = var.ec2_cert_required ? 1 : 0
+  source            = "git::codecommit://module-aws-private-cert?ref=v1"
+  application       = "${local.tag_hostname}-${var.application}"
+  domain_name       = local.cert_domain
+  alternative_names = compact([local.ec2_secondary_region_san, local.ec2_primary_region_san, local.ec2_global_san, local.elb_primary_region_san, local.elb_secondary_region_san])
+  environment       = var.environment
+  tags              = merge(var.tags, local.acm_cert_tag)
+}
+
+resource "aws_ec2_tag" "cert_arn" {
+  count       = var.ec2_cert_required ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "ec2_cert_arn"
+  value       = local.ec2_cert_arn
+}
+
+domain.tf
+
+
+module "ec2_dns_global_record" {
+  source             = "git::codecommit://module-aws-route53-phz-record?ref=v1"
+  record_name        = local.tag_dnsname
+  record_type        = "A"
+  records            = [aws_instance.ec2.private_ip]
+  tags               = var.tags
+  vpc_group          = var.vpc_group
+  vpc_tier           = var.vpc_tier
+  vpc_id             = module.network.vpc_id
+  global_or_regional = "global"
+}
+
+module "ec2_dns_regional_record" {
+  source             = "git::codecommit://module-aws-route53-phz-record?ref=v1"
+  record_type        = "CNAME"
+  record_name        = local.tag_dnsname
+  records            = [module.ec2_dns_global_record.domain]
+  tags               = var.tags
+  vpc_group          = var.vpc_group
+  vpc_tier           = var.vpc_tier
+  global_or_regional = "regional"
+  vpc_id             = module.network.vpc_id
+}
+
+iam.tf
+
+/*
+ * EC2 instance IAM profile.
+ * If create flag is not set to true, this will use the default role (or provided).
+ * If create flag is set to true, this will create a role using default policies.
+ * The resulting role name can obtained from an output variable.
+ */
+
+data "aws_iam_role" "ec2_role" {
+  name = var.ec2_create_role || var.ec2_cert_required ? aws_iam_role.ec2_profile_role[0].name : "EC2SSMDefault"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  count = var.ec2_create_role || var.ec2_cert_required ? 1 : 0
+  name  = join("-", ["EC2SSMDefault", data.aws_region.current.name, local.ec2_name])
+  role  = data.aws_iam_role.ec2_role.name
+}
+
+resource "aws_iam_role" "ec2_profile_role" {
+  count              = var.ec2_create_role || var.ec2_cert_required ? 1 : 0
+  name               = join("-", ["EC2SSMDefault", data.aws_region.current.name, local.ec2_name])
+  tags               = var.tags
+  assume_role_policy = data.aws_iam_policy_document.ec2_profile_assume_role_policy[0].json
+}
+
+data "aws_iam_policy_document" "ec2_profile_assume_role_policy" {
+  count = var.ec2_create_role || var.ec2_cert_required ? 1 : 0
+  statement {
+    effect = "Allow"
+    actions = [
+      "sts:AssumeRole"
+    ]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+# SSM agent permissions.
+resource "aws_iam_role_policy_attachment" "ec2_profile_role_policy_aws_managed" {
+  for_each   = var.ec2_create_role || var.ec2_cert_required ? local.aws_arn_map : {}
+  role       = aws_iam_role.ec2_profile_role[0].name
+  policy_arn = each.value
+}
+
+# SSM agent logging permissions.
+resource "aws_iam_role_policy_attachment" "ec2_profile_role_policy_alight_managed" {
+  for_each   = var.ec2_create_role || var.ec2_cert_required ? local.alight_arn_map : {}
+  role       = aws_iam_role.ec2_profile_role[0].name
+  policy_arn = each.value
+}
+
+# Policy document for  ec2 ACM certificate is required
+
+resource "aws_iam_role_policy" "acm_certificate_policy" {
+  count  = var.ec2_cert_required ? 1 : 0
+  name   = join("-", ["acm-cert", data.aws_region.current.name, local.ec2_name])
+  role   = data.aws_iam_role.ec2_role.name
+  policy = data.aws_iam_policy_document.acm_cert_profile_role_policy_document[0].json
+}
+
+data "aws_iam_policy_document" "acm_cert_profile_role_policy_document" {
+  count = var.ec2_cert_required ? 1 : 0
+  statement {
+    sid    = "RenewAndExportInstanceCertificate"
+    effect = "Allow"
+    actions = [
+      "acm:ExportCertificate",
+      "acm:RenewCertificate",
+      "acm:DescribeCertificate",
+      "acm:GetCertificate"
+    ]
+    resources = [module.private_cert[0].private_cert_arn]
+  }
+}
+
+main.tf
+
+data "aws_organizations_organization" "org" {}
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+data "aws_ssm_parameter" "ad_join_secret" {
+  name = "/terraform/ad-join-secret"
+}
+data "aws_ssm_parameter" "sqs_hostname_url" {
+  name = "/terraform/sqs_hostname_url"
+}
+data "aws_ssm_parameter" "elb_global_phz" {
+  name = var.cert_elb_vpc_tier != null ? "/terraform/privatehostedzone/global/${var.vpc_group}/${var.cert_elb_vpc_tier}" : "/terraform/privatehostedzone/global/${var.vpc_group}/${var.vpc_tier}"
+}
+
+data "aws_ssm_parameter" "elb_regional_phz" {
+  name = var.cert_elb_vpc_tier != null ? "/terraform/privatehostedzone/regional/${var.vpc_group}/${var.cert_elb_vpc_tier}" : "/terraform/privatehostedzone/regional/${var.vpc_group}/${var.vpc_tier}"
+}
+
+data "aws_ssm_parameter" "global_phz" {
+  name = "/terraform/privatehostedzone/global/${var.vpc_group}/${var.vpc_tier}"
+}
+
+data "aws_ssm_parameter" "regional_phz" {
+  name = "/terraform/privatehostedzone/regional/${var.vpc_group}/${var.vpc_tier}"
+}
+
+
+terraform {
+  experiments = [module_variable_optional_attrs]
+}
+
+
+/*
+ * Static local variables.
+ */
+locals {
+  subnet_ids         = var.current_ec2_solution_version != "" ? var.deployment_az == null ? module.network.subnet_class_map[var.subnet_type][random_integer.random_subnet.result] : module.network.subnet_class_az_map[var.subnet_type][var.deployment_az][0] : null
+  security_group_ids = var.current_ec2_solution_version != "" ? (concat(var.security_group_ids, [data.aws_ssm_parameter.windows-sg.value])) : null
+  #
+  #NOTE: Subnet_id and Security_gtoups argumnets are added to handle the scenarios for ec2 running on version below 5.0.5(Bug fix AWS-11411)
+
+
+  # AMI query type (i.e., id or name).
+  query_ami_id = substr(var.ami_name, 0, 4) == "ami-"
+
+  is_fed = data.aws_organizations_organization.org.id == "o-penzjfasnu"
+
+  ec2_name = var.hostname != "" ? var.hostname : "${var.application}-${var.service}-${random_string.ec2_unique_id.result}-${var.environment}"
+
+  region_prefix = data.aws_region.current.name == "us-east-1" ? "e" : "w"
+
+  base_ami = {
+    o-penzjfasnu = "457704260925"
+    o-l0xvscw9dw = "899855515364"
+    o-gsk3v91k20 = "430656786815"
+  }
+
+  base_ami_owner = local.base_ami[data.aws_organizations_organization.org.id]
+
+  # AWS managed policy ARN
+  aws_arn_map = (
+    {
+      "AmazonSSMManagedInstanceCore"    = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+      "AmazonSSMDirectoryServiceAccess" = "arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess"
+    }
+  )
+
+  # Alight managed policy ARN
+  alight_arn_map = (
+    {
+      "ADJoinSecretPolicy-Primary"        = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/ADJoinSecretPolicy-Primary",
+      "alight-ec2-managed-policy-Primary" = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/alight-ec2-managed-policy-Primary",
+      "alight-ec2-managed-policy-DR"      = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/alight-ec2-managed-policy-DR",
+      "ADJoinSecretPolicy-DR"             = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/ADJoinSecretPolicy-DR"
+    }
+  )
+
+  ipsplit      = split(".", aws_instance.ec2.private_ip)
+  gen_hostname = format(join("", [format("%02X", tonumber(local.ipsplit[0])), format("%02X", tonumber(local.ipsplit[1])), format("%02X", tonumber(local.ipsplit[2])), format("%02X", tonumber(local.ipsplit[3]))]))
+
+  tag_hostname = var.hostname != "" ? join("", [var.hostname, local.region_prefix]) : local.gen_hostname
+  tag_dnsname  = var.dns_name == "" ? (var.hostname == "" ? local.gen_hostname : var.hostname) : var.dns_name
+
+  # Logic to determine PatchAZ tag (az) using subnet_id
+  local_subnet_id     = var.deployment_az == null ? module.network.subnet_class_map[var.subnet_type][random_integer.random_subnet.result] : module.network.subnet_class_az_map[var.subnet_type][var.deployment_az][0]
+  local_lookup_az     = [for k, v in module.network.subnet_class_az_map[var.subnet_type] : k if v[0] == local.local_subnet_id]
+  lookup_patch_az_tag = lookup(var.tags, "PatchAZ", "DNE")
+
+  # EC2 ACM Certificate
+  cert_domain              = var.cert_elb_subdomain != null ? "${var.cert_elb_subdomain}.${data.aws_ssm_parameter.elb_regional_phz.value}" : "${local.tag_dnsname}.${data.aws_ssm_parameter.regional_phz.value}"
+  ec2_primary_region_san   = "${local.tag_dnsname}.${data.aws_ssm_parameter.global_phz.value}"
+
+  tmp_global_phz_value     = var.cert_elb_vpc_tier == null ? data.aws_ssm_parameter.global_phz.value : data.aws_ssm_parameter.elb_global_phz.value
+
+  ec2_secondary_region_san = var.cert_secondary_region != null ? "${local.tag_dnsname}.${replace(local.tmp_global_phz_value, data.aws_region.current.name, var.cert_secondary_region)}" : ""
+
+  ec2_global_san = var.cert_elb_subdomain != null ? "${local.tag_dnsname}.${data.aws_ssm_parameter.regional_phz.value}" : ""
+  
+  elb_primary_region_san   = var.cert_elb_subdomain != null ? "${var.cert_elb_subdomain}.${data.aws_ssm_parameter.elb_global_phz.value}" : ""
+  elb_secondary_region_san = var.cert_secondary_region != null && var.cert_elb_subdomain != null ? "${var.cert_elb_subdomain}.${replace(local.tmp_global_phz_value, data.aws_region.current.name, var.cert_secondary_region)}" : ""
+  ec2_cert_arn             = var.ec2_cert_required ? module.private_cert[0].private_cert_arn : null
+
+  # Tag for ACM Certifacte 
+  acm_cert_tag = var.ec2_cert_required == true ? { ResourceAssociation = "ec2" } : { null : null }
+
+  ansible_roles = [
+    for automation in var.ansible_automation :
+      format("role_%s", replace(trimspace(automation.role), " " , "_"))
+        if trimspace(automation.role) != ""
+  ]
+  ansible_clusters = [
+    for automation in var.ansible_automation :
+      format("role_%s_cluster_%s", replace(trimspace(automation.role), " " , "_"), replace(trimspace(automation.cluster), " " , "_"))
+        if (trimspace(automation.role) != "" && trimspace(automation.cluster) != "")
+  ]
+}
+
+/*
+ * Queries the account network.
+ */
+
+module "network" {
+  source = "git::codecommit://module-aws-network-data?ref=v2"
+  #  source       = "../module-aws-network-data"
+  vpc_group = var.vpc_group
+  vpc_tier  = var.vpc_tier
+}
+
+resource "random_integer" "random_subnet" {
+  max = length(module.network.subnet_class_map[var.subnet_type]) - 1
+  min = 0
+}
+
+resource "random_string" "ec2_unique_id" {
+  length  = 7
+  special = false
+}
+
+module "ebs" {
+  source = "git::codecommit://module-aws-ebs?ref=v1"
+  count  = var.ebs_attachment == null ? 0 : length(var.ebs_attachment)
+
+  tags = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "mount_point", null) == null ? { MountPoint = keys(var.ebs_attachment)[count.index] } : { MountPoint = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "mount_point") }
+
+  availability_zone = aws_instance.ec2.availability_zone
+  size              = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "size", null)
+  kms_key_id        = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "kms_key_id", null)
+  iops              = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "iops", null)
+  type              = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "type", null)
+  throughput        = lookup(lookup(var.ebs_attachment, element(keys(var.ebs_attachment), count.index)), "throughput", null)
+
+  attachment = tomap({ instance_id = aws_instance.ec2.id, device_name = keys(var.ebs_attachment)[count.index] })
+}
+
+nic.tf
+
+# NIC configuration
+# Current Version V5,v5.0 and v5.0.6 and above
+resource "aws_network_interface" "secondary_ips" {
+  subnet_id         = var.deployment_az == null ? module.network.subnet_class_map[var.subnet_type][random_integer.random_subnet.result] : module.network.subnet_class_az_map[var.subnet_type][var.deployment_az][0]
+  security_groups   = concat(var.security_group_ids, [data.aws_ssm_parameter.windows-sg.value])
+  private_ips_count = var.secondary_ips_count
+  tags              = var.tags
+
+  count = var.current_ec2_solution_version == "" ? 1 : 0
+}
+
+# Between v5.0.2 to v5.0.5
+
+resource "aws_network_interface" "secondary_ip" {
+  subnet_id         = var.deployment_az == null ? module.network.subnet_class_map[var.subnet_type][random_integer.random_subnet.result] : module.network.subnet_class_az_map[var.subnet_type][var.deployment_az][0]
+  security_groups   = concat(var.security_group_ids, [data.aws_ssm_parameter.windows-sg.value])
+  private_ips_count = var.secondary_ips_count
+
+  attachment {
+    instance     = aws_instance.ec2.id
+    device_index = 1
+  }
+  count = var.current_ec2_solution_version == 1 ? 1 : 0
+}
+
+outputs.tf
+
+/*
+ * Output values.
+ */
+output "arn" {
+  value       = aws_instance.ec2.arn
+  description = "The instance arn."
+}
+
+output "ec2_instance_id" {
+  value       = aws_instance.ec2.id
+  description = "The instance id."
+}
+
+output "ec2_instance_az" {
+  value       = aws_instance.ec2.availability_zone
+  description = "The instance availability zone."
+}
+
+output "ec2_instance_role_name" {
+  value       = data.aws_iam_role.ec2_role.name
+  description = "The instance profile role."
+}
+
+output "private_ip" {
+  value       = aws_instance.ec2.private_ip
+  description = "The private ip address."
+}
+
+output "secondary_ips" {
+  value       = aws_instance.ec2.secondary_private_ips
+  description = "List of secondary private IPs"
+}
+
+output "root_block_device_id" {
+  value       = aws_instance.ec2.root_block_device[0].volume_id
+  description = "The root OS volume id."
+}
+
+output "root_block_device_size" {
+  value       = aws_instance.ec2.root_block_device[0].volume_size
+  description = "The root OS volume size."
+}
+
+output "apps_block_device_id" {
+  value       = aws_instance.ec2.ebs_block_device[*].volume_id
+  description = "The apps volume id."
+}
+
+output "apps_block_device_size" {
+  value       = aws_instance.ec2.ebs_block_device[*].volume_size
+  description = "The apps volume size."
+}
+
+output "regional_dns_fqdn" {
+  value       = module.ec2_dns_regional_record.domain
+  description = "Regional domain name"
+}
+
+output "subnet_eip_map" {
+  value       = local.ec2_name
+  description = "hexcode_hostname"
+}
+
+output "global_dns_fqdn" {
+  value       = module.ec2_dns_global_record.domain
+  description = "Global domain name"
+}
+
+output "instance_az" {
+  value       = local.local_lookup_az[0]
+  description = "Determined AZ that the instance will be deployed into based on vpc group/subnet id."
+}
+
+output "ec2_cert_arn" {
+  value       = local.ec2_cert_arn
+  description = "EC2 Instance private cert arn"
+}
+
+Readme.tf
+# module-aws-ec2-windows
+## Overview
+This module creates an ec2 instance and performs any necessary deployment configuration.
+A quick terraform example to create an EC2 instance is as below:
+```
+	module "ec2_win" {
+		source             = "git::codecommit://module-aws-ec2-windows?ref=v5"
+		ami_name           = "alight_windows2019datacenter*"
+		instance_type      = "t2.medium"
+		security_group_ids = ["sg-087a004937ce865e7"] # policy-staging-app-windows
+		vpc_group          = "policy-staging"
+		application        = "my-application"
+		environment        = "dv"
+		service            = "my-service"
+		hostname           = "my-hostname"
+		ec2_cert_required  = "true"
+		tags               = {}
+	}
+``` 
+
+
+**Note**: EC2 will be registered to domain with userdata script. Also, the user data script needs to be double maintained. There is a version of the user data script for the primary region and DR region (see user_data folder).
+
+**Note**: If you are upgrading EC2 module to latest version, please check this link to avoid any destroy and create - https://alightsolutionsllc.sharepoint.com/:w:/r/sites/CloudTransform/_layouts/15/Doc.aspx?sourcedoc=%7BFA72D6C3-137D-4E73-891F-D467AF5C39E8%7D&%3Bfile=runnbook_windows_version_upgrade.docx&%3Baction=default&%3Bmobileredirect=true&isSPOFile=1 
+
+**Note**: If ec2_create_role is "true" being passed in, the AmazonSSMManagedInstanceCore, AmazonSSMDirectoryServiceAccess, ADJoinSecretPolicy, SSMLoggingBucketAccess, ADJoinSecretPolicy-DR and SSMLoggingBucketAccess-DR 
+will be included as an attached policy.
+
+**Note**: Due to a bug with .tags_all, tags have been moved to the tags.tf file and will be added as resources. This will show many new "Creates" and "Updates" during applies.
+
+**Note**: Changes to volume tags will cause changes during terraform plan and removal of tags from root volume. See the following example of the plan below.
+
+```
+Terraform will perform the following actions:
+
+  # module.ec2_win_web.aws_instance.ec2 will be updated in-place
+  ~ resource "aws_instance" "ec2" {
+        id                                   = "i-02e9d6e4e711e3c23"
+        tags                                 = {
+            "BackupPolicyOS" = "Windows"
+            "GlobalDNS"      = "0a117511.appsa.***.aws.alight.com"
+            "Hostname"       = "0A117511"
+            "Name"           = "tf-module-ci-test-terraform-UnUG6Uo-dv"
+            "PatchAZ"        = "b"
+            "Platform"       = "Windows"
+            "RegionalDNS"    = "0a117511.appsa.aws.alight.com"
+            "Test"           = "Test"
+        }
+      ~ volume_tags                          = {
+          - "MountPoint" = "OS" -> null
+          - "Name"       = "tf-module-ci-test-terraform-UnUG6Uo-dv-ebs" -> null
+          - "Test"       = "Test" -> null
+        }
+        # (28 unchanged attributes hidden)
+
+        # (6 unchanged blocks hidden)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+
+---
+## Dependencies (Modules)
+**Note: May have other dependencies not listed below**
+
+- module-aws-private-cert
+	- v1
+- module-aws-route53-phz-record
+	- v1
+- module-aws-network-data
+	- v2
+- module-aws-ebs
+	- AWS-3996
+---
+## Inputs
+### Required
+- ami_name
+	- Description: "The base ami name to utilize (ex. 'alight-rhel78base_1.*')."
+	- Type: string
+- instance_type
+	- Description: "The instance type to utilize."
+	- Type: string
+- vpc_group
+	- Description: "VPC Group you are looking to pull network information for. These values are custom based on VPC creation process."
+	- Type: string
+- tags
+	- Description: "Tags used to sort/reference the ec2 resource."
+	- Type: map(string)
+- application
+	- Description: "Project name, all lowercase with no spaces (ie. idb, eloise, ect.)"
+	- Type: string
+- service
+	- Description: "Service name, all lowercase with no spaces but dashes okay (ie. ui, transmit, ect.)"
+	- Type: string
+- environment
+	- Description: "Environment name, all lowercase with no spaces (ie. lb, dv, qa, ect.)"
+	- Type: string
+### Optional Inputs
+- security_group_ids
+	- Description: "List of security group IDs to associate with."
+	- Type: list(string)
+	- Default Value: []
+- vendor_ami_owner
+	- Description: "Vendor Ami Owner should only be passed in if this instance is to be treated as an appliance. This means that NO Alight patching and operational tools will be installed and run on this instance. It is up to the service owner to maintain this instance and keep it current working with our infrastructure operational teams. Setting this value will automatically attach a AmiVendor tag key with the value passed in"
+	- Type: string
+	- Default Value: ""
+- vpc_tier
+	- Description: "VPC Tier you are looking to pull network information for. Valid Values are 'web', 'app', 'db', and 'single'."
+	- Type: string
+	- Default Value: "app"
+- subnet_type
+	- Description: "Subnet type to which to deploy EC2 instance. 'public' is not allowed."
+	- Type: string
+	- Default Value: "private"
+- ec2_create_role
+	- Description: "Indicates if an EC2 role should be created"
+	- Type: bool
+	- Default Value: false
+- deployment_az
+	- Description: "AZ to deploy the instance in (a, b, c, ...). If null, a random AZ is selected"
+	- Type: string
+	- Default Value: null
+- hostname
+	- Description: "Used to set the computer name / host name in the OS and register to AD.  This hostname is used for integration with additional operational agents (i.e. netbackup, puppet, etc…).  The value passed in must be less than 14 characters and a 1 character value will be prepended to the name based on the region deployed.  Here are the valid values:  e : us-east-1 and w : us-west-2."
+	- Type: string
+	- Default Value: ""
+- dns_name
+	- Description: "Used to set the dns name in our global and regional aws private hosted zones. "
+	- Type: string
+	- Default Value: ""
+- enable_termination_protection
+	- Description: "Enable instance termination protection"
+	- Type: bool
+	- Default Value: false
+- cert_secondary_region
+	- Description: "This will ONLY be used if ec2_cert_required is true. Add an aws region here if this EC2 instance requires a backup in a DR region. This input should be the DR region for this deployment. It will add the DR SAN values to the certificate. ex. us-west-2. If no DR is needed for this instance, keep this value null.  "
+	- Type: string
+	- Default Value: null
+- cert_elb_subdomain
+	- Description: "This will ONLY be used if ec2_cert_required is true. Set this value if NLB does not terminate TLS. Top level domain is generated in ec2 module"
+	- Type: string
+	- Default Value: null
+- cert_elb_vpc_tier
+	- Description: "This will ONLY be used if ec2_cert_required is true. Additionally, this will only be used when the ELB is in a different VPC Tier than the EC2 instance. Set this value if NLB does not terminate TLS. Top level domain is generated in ec2 module"
+	- Type: string
+	- Default Value: null
+- ec2_cert_required
+	- Description: "This will ONLY be used if ec2_cert_required is true."
+	- Type: bool
+	- Default Value: false
+- is_dr
+	- Description: "Will determine if the AMI passed in should be used or if we need to fetch the AMI based on backup tags."
+	- Type: bool
+	- Default Value: false
+- backup_plan
+	- Description: "Required if is_dr is true. DR backup plan policy for this EC2 instance."
+	- Type: string
+	- Default Value: ""
+- backup_name
+	- Description: "Required if backup_plan is passed in or is_dr is true. Uniquely identify the EC2 instance backup item."
+	- Type: string
+	- Default Value: ""
+- backup_OS
+	- Description: "Indicates if an EC2 instance will be AUTO tagged for backup. If this value is set to true, the user can NOT pass in a tag key of 'BackupPolicyOS'. If user wants to override default 'BackupPolicyOS' value, then set var.backup_OS to false and pass in tag key 'BackupPolicyOS' with custom policy."
+	- Type: bool
+	- Default Value: true
+- kms_key_arn
+	- Description: "KMS Key ARN if not using the AccountLevelKey"
+	- Type: string
+	- Default Value: null
+- root_volume_size
+	- Description: "number in GB for root volume AKA OS disk"
+	- Type: number
+	- Default Value: null
+- secondary_ips_count
+	- Description: "Count of additional ips to be associated with ec2 instance (The total number of private IPs will be 1 + private_ips_count, as a primary private IP will be assiged by default)"
+	- Type: number
+	- Default Value: 0
+- current_ec2_solution_version
+	- Description: "(Default) for current Version V5,v5.0 and v5.0.6 and above || 1 Between v5.0.2 to v5.0.5 || 2  v4 and below (including ,v5.0.0. v5.0.1)"
+	- Type: string
+	- Default Value: ""
+- puppet_role
+	- Description: "Will be required as platforms built out. Base is an unconfigured ec2."
+	- Type: string
+	- Default Value: "base"
+- puppet_environment
+	- Description: "The puppet environment the ec2 will be configured against."
+	- Type: string
+	- Default Value: "production"
+- puppet_trusted_facts
+	- Description: "Optional puppet facts needed via puppet role."
+	- Default Value: {}
+ - ansible_environment
+     - Description: "The ansible environment the ec2 will be configured against."
+     - Default Value: "production"
+ - ansible_automation
+     - Description: "Optional ansible roles and clusters to apply to server."
+     - Default Value: []	
+- key_pair_name
+	- Description: "Key name of the key pair to use for the instance. This value will only be accepted if the vendor_ami_owner is passed in."
+	- Type: string
+	- Default Value: null
+	
+#### EBS Volume Creation and Attachment
+`ebs_attachment`
+Description: "Map used to create and attach EBS volumes where the key for each volume will be the device name to be used. For more information on the EBS module is [here.](https://console.aws.amazon.com/codesuite/codecommit/repositories/module-aws-ebs/browse?region=us-east-1)"
+
+Type : map(object())
+
+Default Value: null
+
+Attributes:
++ `size`
+	- "The size of the volume to be created in GiBs"
+	- Type: number
+
+Optional Attributes
++ `kms_key_id`
+	- "The ARN of the KMS key to be used for encryption"
+	- Default Value: accountLevelKey
+	- Type: string
++ `type`
+	- "`standard`, `gp2`, `gp3`, `io1`, `io2`, `sc1` or `st1`. For more info click [here.](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volume-types.html)"
+	- Default Value: gp3
+	- Type: string
++ `throughput`
+	- "In MiB/s. For more info click [here.](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volume-types.html)"
+	- Default Value: 100
+	- Type: number
++ `iops`
+	- "The amount of IOPS to be provisioned. For more info click [here.](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volume-types.html#EBSVolumeTypes_piops)"
+	- Default Value: 125
+	- Type: number
++ `mount_point`
+	- "The mount point on the operating system."
+	- Default Value: ebs_attachment key (In the example below, the first volume will use "/dev/sdh")
+	- Type: string
+
+Example:
+```
+ebs_attachment     = {
+	"/dev/sdh" = {size = 10}
+	"/dev/sdb" = {
+		size = 20,
+		kms_key_id = "arn:aws:kms:us-east-1:686437426460:key/9cab08a8-839d-4d7e-87ab-66237d4d264d",
+		type = "gp3",
+		iops = 300,
+		throughput = 1000
+		mount_point = "/apps"
+	}
+}
+```
+---
+## Output
+- arn
+	- Description: The instance arn.
+- ec2_instance_id
+	- Description: The instance id.
+- ec2_instance_az
+	- Description: The instance availability zone.
+- ec2_instance_role_name
+	- Description: The instance profile role.
+- private_ip
+	- Description: The private ip address.
+- secondary_ips
+	- Description: List of secondary private IPs
+- root_block_device_id
+	- Description: The root OS volume id.
+- root_block_device_size
+	- Description: The root OS volume size.
+- apps_block_device_id
+	- Description: The apps volume id.
+- apps_block_device_size
+	- Description: The apps volume size.
+- regional_dns_fqdn
+	- Description: Regional domain name
+- subnet_eip_map
+	- Description: hexcode_hostname
+- global_dns_fqdn
+	- Description: Global domain name
+- instance_az
+	- Description: Determined AZ that the instance will be deployed into based on vpc group/subnet id.
+- ec2_cert_arn
+	- Description: EC2 Instance private cert arn
+---
+## Potential Resources Created
+- private_cert
+	- Type: module
+	- Source: git::codecommit://module-aws-private-cert?ref=v1
+- cert_arn
+	- Type: resource
+	- Source: aws_ec2_tag
+- ec2_dns_global_record
+	- Type: module
+	- Source: git::codecommit://module-aws-route53-phz-record?ref=v1
+- ec2_dns_regional_record
+	- Type: module
+	- Source: git::codecommit://module-aws-route53-phz-record?ref=v1
+- ec2
+	- Type: resource
+	- Source: aws_instance
+- ec2_profile
+	- Type: resource
+	- Source: aws_iam_instance_profile
+- ec2_profile_role
+	- Type: resource
+	- Source: aws_iam_role
+- ec2_profile_role_policy_aws_managed
+	- Type: resource
+	- Source: aws_iam_role_policy_attachment
+- ec2_profile_role_policy_alight_managed
+	- Type: resource
+	- Source: aws_iam_role_policy_attachment
+- acm_certificate_policy
+	- Type: resource
+	- Source: aws_iam_role_policy
+- network
+	- Type: module
+	- Source: git::codecommit://module-aws-network-data?ref=v2
+- random_subnet
+	- Type: resource
+	- Source: random_integer
+- ec2_unique_id
+	- Type: resource
+	- Source: random_string
+- ebs
+	- Type: module
+	- Source: git::codecommit://module-aws-ebs?ref=AWS-3996
+- secondary_ips
+	- Type: resource
+	- Source: aws_network_interface
+- secondary_ip
+	- Type: resource
+	- Source: aws_network_interface
+- hostname
+	- Type: resource
+	- Source: aws_ec2_tag
+- globalDNSTag
+	- Type: resource
+	- Source: aws_ec2_tag
+- RegionalDNSTag
+	- Type: resource
+	- Source: aws_ec2_tag
+- Name_Tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- platform_tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- backup_plan_tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- backup_name_tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- backup_OS_tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- ami_vendor_tag
+	- Type: resource
+	- Source: aws_ec2_tag
+- patch_az
+	- Type: resource
+	- Source: aws_ec2_tag
+
+tags.tf
+resource "aws_ec2_tag" "hostname" {
+  resource_id = aws_instance.ec2.id
+  key         = "Hostname"
+  value       = local.tag_hostname
+}
+
+resource "aws_ec2_tag" "globalDNSTag" {
+  resource_id = aws_instance.ec2.id
+  key         = "GlobalDNS"
+  value       = module.ec2_dns_global_record.domain
+}
+
+resource "aws_ec2_tag" "RegionalDNSTag" {
+  resource_id = aws_instance.ec2.id
+  key         = "RegionalDNS"
+  value       = module.ec2_dns_regional_record.domain
+}
+
+resource "aws_ec2_tag" "Name_Tag" {
+  resource_id = aws_instance.ec2.id
+  key         = "Name"
+  value       = local.ec2_name
+}
+
+resource "aws_ec2_tag" "platform_tag" {
+  resource_id = aws_instance.ec2.id
+  key         = "Platform"
+  value       = "Windows"
+}
+
+resource "aws_ec2_tag" "backup_plan_tag" {
+  count       = var.backup_plan != "" && var.is_dr == false ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "BackupPlan"
+  value       = var.backup_plan
+}
+
+resource "aws_ec2_tag" "backup_name_tag" {
+  count       = var.backup_name != "" && var.is_dr == false ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "BackupName"
+  value       = var.backup_name
+}
+
+resource "aws_ec2_tag" "backup_OS_tag" {
+  count       = var.backup_OS == true && var.is_dr == false ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "BackupPolicyOS"
+  value       = "Windows"
+}
+
+resource "aws_ec2_tag" "ami_vendor_tag" {
+  count       = var.vendor_ami_owner != "" ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "AmiVendor"
+  value       = var.vendor_ami_owner
+}
+
+resource "aws_ec2_tag" "patch_az" {
+  resource_id = aws_instance.ec2.id
+  key         = "PatchAZ"
+  value       = lookup(var.tags, "PatchAZ", "") != "" ? lookup(var.tags, "PatchAZ") : var.vendor_ami_owner != "" ? "MVA" : (local.lookup_patch_az_tag == "DNE" ? local.local_lookup_az[0] : null)
+}
+
+resource "aws_ec2_tag" "ansible_roles_tag" {
+  count       = length(local.ansible_roles) > 0 ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "AnsibleRoles"
+  value       = join(",", local.ansible_roles)
+}
+
+resource "aws_ec2_tag" "ansible_clusters_tag" {
+  count       = length(local.ansible_clusters) > 0  ? 1 : 0
+  resource_id = aws_instance.ec2.id
+  key         = "AnsibleClusters"
+  value       = join(",", local.ansible_clusters)
+}
+
+resource "aws_ec2_tag" "ansible_environment_tag" {
+  resource_id = aws_instance.ec2.id
+  key         = "AnsibleEnvironment"
+  value       = var.ansible_environment
+}
+
+user_data.tf
+locals {
+  # Puppet hostname
+  puppet_hostname = local.is_fed ? "puppet.fissa.alight-fed.com" : "puppet.apissa.aws.alight.com"
+
+  # Puppet CSR attributes.
+  unfiltered_extensions = merge({
+    "pp_role" : var.puppet_role,
+    "pp_environment" : var.puppet_environment,
+    "pp_service" : var.service,
+    "pp_application" : var.application,
+    "pp_apptier" : var.environment
+  }, var.puppet_trusted_facts)
+
+  filtered_extensions = {
+    for extension, value in local.unfiltered_extensions :
+    extension => value if value != null
+  }
+}
+
+data "aws_ssm_parameter" "saviynt_credentials" {
+  name = "/terraform/solution-saviynt-credentials"
+}
+
+data "template_file" "user_data" {
+  template = var.is_dr ? file("${path.module}/user_data/init_dr.tpl") : local.is_fed ? file("${path.module}/user_data/init_fedprimary.tpl") : file("${path.module}/user_data/init_primary.tpl")
+  vars = {
+    hostname                 = var.hostname != "" ? join("", [var.hostname, local.region_prefix]) : ""
+    domain                   = data.aws_ssm_parameter.global_phz.value
+    adjoinsecret             = data.aws_ssm_parameter.ad_join_secret.value
+    puppet_hostname          = local.puppet_hostname
+    csr_attributes           = yamlencode({ "extension_requests" : local.filtered_extensions })
+    ansible_environment      = var.ansible_environment
+    ansible_automation       = jsonencode(var.ansible_automation)    
+    sqs_url                  = data.aws_ssm_parameter.sqs_hostname_url.value
+    cpam_user                = "cpam-user"
+    cpam_adds                = "cpamuser"
+    saviyntcredentialssecret = data.aws_ssm_parameter.saviynt_credentials.value
+  }
+}
+
+variables.tf
+/*
+ * Required input variables.
+ */
+
+variable "ami_name" {
+  type        = string
+  description = "The base ami name to utilize (ex. 'alight-rhel78base_1.*')."
+}
+
+variable "instance_type" {
+  type        = string
+  description = "The instance type to utilize."
+}
+
+variable "vpc_group" {
+  type        = string
+  description = "VPC Group you are looking to pull network information for. These values are custom based on VPC creation process."
+}
+
+variable "security_group_ids" {
+  type        = list(string)
+  description = "List of security group IDs to associate with."
+  default     = []
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Tags used to sort/reference the ec2 resource."
+}
+
+variable "application" {
+  type        = string
+  description = "Project name, all lowercase with no spaces (ie. idb, eloise, ect.)"
+}
+
+variable "service" {
+  type        = string
+  description = "Service name, all lowercase with no spaces but dashes okay (ie. ui, transmit, ect.)"
+}
+
+variable "environment" {
+  type        = string
+  description = "Environment name, all lowercase with no spaces (ie. lb, dv, qa, ect.)"
+}
+
+/*
+ * Optional input variables.
+ */
+
+variable "vendor_ami_owner" {
+  type        = string
+  description = "Vendor Ami Owner should only be passed in if this instance is to be treated as an appliance. This means that NO Alight patching and operational tools will be installed and run on this instance. It is up to the service owner to maintain this instance and keep it current working with our infrastructure operational teams. Setting this value will automatically attach a AmiVendor tag key with the value passed in"
+  default     = ""
+}
+
+variable "vpc_tier" {
+  type        = string
+  description = "VPC Tier you are looking to pull network information for. Valid Values are 'web','app', 'db', and 'single'."
+  default     = "app"
+}
+
+variable "subnet_type" {
+  type        = string
+  description = "Subnet type to which to deploy EC2 instance. 'public' is not allowed."
+  default     = "private"
+
+  validation {
+    condition     = var.subnet_type != "public"
+    error_message = "Public subnet_type is not allowed."
+  }
+}
+
+variable "ec2_create_role" {
+  type        = bool
+  default     = false
+  description = "Indicates if an EC2 role should be created"
+}
+
+variable "deployment_az" {
+  type        = string
+  default     = null
+  description = "AZ to deploy the instance in (a, b, c, ...). If null, a random AZ is selected"
+}
+
+variable "hostname" {
+  type        = string
+  default     = ""
+  description = "Used to set the computer name / host name in the OS and register to AD.  This hostname is used for integration with additional operational agents (i.e. netbackup, puppet, etc…).  The value passed in must be less than 14 characters and a 1 character value will be prepended to the name based on the region deployed.  Here are the valid values:  e : us-east-1 and w : us-west-2."
+  validation {
+    condition     = length(var.hostname) < 14
+    error_message = "The hostname cannot be more than 14 characters."
+  }
+}
+
+variable "dns_name" {
+  type        = string
+  default     = ""
+  description = "Used to set the dns name in our global and regional aws private hosted zones. "
+}
+
+variable "enable_termination_protection" {
+  type        = bool
+  default     = false
+  description = "Enable instance termination protection"
+}
+
+variable "cert_secondary_region" {
+  type        = string
+  default     = null
+  description = "This will ONLY be used if ec2_cert_required is true. Add an aws region here if this EC2 instance requires a backup in a DR region. This input should be the DR region for this deployment. It will add the DR SAN values to the certificate. ex. us-west-2. If no DR is needed for this instance, keep this value null.  "
+}
+variable "cert_elb_subdomain" {
+  type        = string
+  default     = null
+  description = "This will ONLY be used if ec2_cert_required is true. Set this value if NLB does not terminate TLS. Top level domain is generated in ec2 module"
+}
+
+variable "cert_elb_vpc_tier" {
+  type        = string
+  default     = null
+  description = "This will ONLY be used if ec2_cert_required is true. Additionally, this will only be used when the ELB is in a different VPC Tier than the EC2 instance. Set this value if NLB does not terminate TLS. Top level domain is generated in ec2 module"
+}
+
+variable "ec2_cert_required" {
+  type        = bool
+  default     = false
+  description = "This will ONLY be used if ec2_cert_required is true."
+}
+
+variable "is_dr" {
+  type        = bool
+  default     = false
+  description = "Will determine if the AMI passed in should be used or if we need to fetch the AMI based on backup tags."
+}
+
+variable "backup_plan" {
+  type        = string
+  default     = ""
+  description = "Required if is_dr is true. DR backup plan policy for this EC2 instance."
+}
+
+variable "backup_name" {
+  type        = string
+  default     = ""
+  description = "Required if backup_plan is passed in or is_dr is true. Uniquely identify the EC2 instance backup item."
+}
+
+variable "backup_OS" {
+  type        = bool
+  default     = true
+  description = "Indicates if an EC2 instance will be AUTO tagged for backup. If this value is set to true, the user can NOT pass in a tag key of 'BackupPolicyOS'. If user wants to override default 'BackupPolicyOS' value, then set var.backup_OS to false and pass in tag key 'BackupPolicyOS' with custom policy."
+}
+
+variable "kms_key_arn" {
+  type        = string
+  default     = null
+  description = "KMS Key ARN if not using the AccountLevelKey"
+}
+
+variable "root_volume_size" {
+  description = "number in GB for root volume AKA OS disk"
+  type        = number
+  default     = null
+}
+
+variable "secondary_ips_count" {
+  type        = number
+  description = "Count of additional ips to be associated with ec2 instance (The total number of private IPs will be 1 + private_ips_count, as a primary private IP will be assiged by default)"
+  default     = 0
+}
+
+variable "current_ec2_solution_version" {
+  type        = string
+  description = "(Default) for current Version V5,v5.0 and v5.0.6 and above || 1 Between v5.0.2 to v5.0.5 || 2  v4 and below (including ,v5.0.0. v5.0.1)"
+  default     = ""
+}
+
+variable "puppet_role" {
+  type        = string
+  default     = "base"
+  description = "Will be required as platforms built out. Base is an unconfigured ec2."
+}
+
+variable "puppet_environment" {
+  type        = string
+  default     = "production"
+  description = "The puppet environment the ec2 will be configured against."
+
+  validation {
+    condition     = contains(["production", "development"], var.puppet_environment)
+    error_message = "Only allowed environments are production and development."
+  }
+}
+
+variable "puppet_trusted_facts" {
+  type        = object({ pp_cluster = optional(string) })
+  default     = {}
+  description = "Optional puppet facts needed via puppet role."
+}
+
+variable "ansible_environment" {
+  type        = string
+  default     = "production"
+  description = "The ansible environment the ec2 will be configured against."
+
+  validation {
+    condition     = contains(["production", "development"], var.ansible_environment)
+    error_message = "Only allowed environments are production and development."
+  }  
+}
+
+variable "ansible_automation" {
+  description = "The ansible roles and clusters to apply to server."
+  type = list(object({
+    role    = string
+    cluster = string
+  }))
+  default = []
+}
+
+variable "key_pair_name" {
+  type        = string
+  default     = null
+  description = "Key name of the key pair to use for the instance. This value will only be accepted if the vendor_ami_owner is passed in."
+}
+
+variable "ebs_attachment" {
+  type = map(object({
+    size        = number,
+    kms_key_id  = optional(string),
+    iops        = optional(number),
+    type        = optional(string),
+    throughput  = optional(number),
+    mount_point = optional(string)
+  }))
+  default     = null
+  description = "Map used to create and attach EBS volumes"
+}
+
+changelog.md
+# module-aws-ec2-windows : changelog
+---
+## v5.12.2 (Jan 25th, 2023)
+FEATURE:
+- CPAM - Create Standalone SSM Windows Bootstrap Script. (# [AWS2-18104](https://alightdevelopmentandit.atlassian.net/browse/AWS2-18104))
+
+Drift Impact:
+- No
+
+ ## v5.12.1 (December 6th, 2022)
+ BUGFIX:
+- Update module bug fix nic.tf to support single vpc module. (# [AWS4-17672](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17672))
+
+Drift Impact:
+- No
+ ## v5.12.0 (November 1st, 2022)
+ FEATURE:
+ - Update userdata to bootstrap using ansible. (# [AWS2-17641](https://alightdevelopmentandit.atlassian.net/browse/AWS2-17641))
+
+ Drift Impact:
+ - Yes, at least one (up to three) new Ansible tags. No service interruption.
+
+```
+Terraform will perform the following actions:
+
+  # module.ec2_windows.aws_ec2_tag.ansible_environment_tag[0] will be created
+  + resource "aws_ec2_tag" "ansible_environment_tag" {
+      + id          = (known after apply)
+      + key         = "AnsibleEnvironment"
+      + resource_id = "i-0a5e611df1886c809"
+      + value       = "production"
+    }
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+## v5.11.0 (October 12th, 2022)
+ENHANCEMENT:
+- Updated user data script to support CLZ CPAM solution from Saviynt.(# [AWS4-17451](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17451))
+
+BUGFIX:
+- Update module to support VPC flattening by updating vpc_tier to include single. (# [AWS4-17578](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17578))
+
+Drift Impact:
+- No
+
+---
+## v5.10.1 (Sep. 9th, 2022)
+BUGFIX:
+- Incorrect domains appended to names on cert. (# [AWS4-17459](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17459))
+
+Drift Impact:
+- Conditional, if team needs EC2 module to create ACM private cert for EC2, and the ELB is in a different VPC tier where the EC2 is provisioned.
+
+```
+Terraform will perform the following actions:
+
+  # module.ec2_win_upgrade.data.aws_iam_policy_document.acm_cert_profile_role_policy_document[0] will be read during apply
+  # (config refers to values not yet known)
+ <= data "aws_iam_policy_document" "acm_cert_profile_role_policy_document"  {
+      ~ id      = "3142888223" -> (known after apply)
+      ~ json    = jsonencode(
+            {
+              - Statement = [
+                  - {
+                      - Action   = [
+                          - "acm:RenewCertificate",
+                          - "acm:GetCertificate",
+                          - "acm:ExportCertificate",
+                          - "acm:DescribeCertificate",
+                        ]
+                      - Effect   = "Allow"
+                      - Resource = "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77"
+                      - Sid      = "RenewAndExportInstanceCertificate"
+                    },
+                ]
+              - Version   = "2012-10-17"
+            }
+        ) -> (known after apply)
+      - version = "2012-10-17" -> null
+
+      ~ statement {
+          - not_actions   = [] -> null
+          - not_resources = [] -> null
+          ~ resources     = [
+              - "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77",
+              ~ (known after apply),
+            ]
+            # (3 unchanged attributes hidden)
+        }
+    }
+
+  # module.ec2_win_upgrade.aws_ec2_tag.cert_arn[0] will be updated in-place
+  ~ resource "aws_ec2_tag" "cert_arn" {
+        id          = "i-0771baacaa7dfe79f,ec2_cert_arn"
+      ~ value       = "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77" -> (known after apply)
+        # (2 unchanged attributes hidden)
+    }
+
+  # module.ec2_win_upgrade.aws_iam_role_policy.acm_certificate_policy[0] will be updated in-place
+  ~ resource "aws_iam_role_policy" "acm_certificate_policy" {
+        id     = "EC2SSMDefault-***-ec2-hostname:acm-cert-***-ec2-hostname"
+        name   = "acm-cert-***-ec2-hostname"
+      ~ policy = jsonencode(
+            {
+              - Statement = [
+                  - {
+                      - Action   = [
+                          - "acm:RenewCertificate",
+                          - "acm:GetCertificate",
+                          - "acm:ExportCertificate",
+                          - "acm:DescribeCertificate",
+                        ]
+                      - Effect   = "Allow"
+                      - Resource = "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77"
+                      - Sid      = "RenewAndExportInstanceCertificate"
+                    },
+                ]
+              - Version   = "2012-10-17"
+            }
+        ) -> (known after apply)
+        # (1 unchanged attribute hidden)
+    }
+
+  # module.ec2_win_upgrade.module.private_cert[0].aws_acm_certificate.cert must be replaced
+-/+ resource "aws_acm_certificate" "cert" {
+      ~ arn                       = "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77" -> (known after apply)
+      ~ domain_validation_options = [] -> (known after apply)
+      ~ id                        = "arn:aws:acm:***:686437426460:certificate/3a9dfaa9-78f6-485d-a4ac-725e58d4cd77" -> (known after apply)
+      ~ status                    = "ISSUED" -> (known after apply)
+      ~ subject_alternative_names = (sensitive) # forces replacement
+        tags                      = {
+            "Name"                = "ec2-hostnamee-tf-module-ci-test23-dv"
+            "ResourceAssociation" = "ec2"
+        }
+      ~ validation_emails         = [] -> (known after apply)
+      ~ validation_method         = "NONE" -> (known after apply)
+        # (3 unchanged attributes hidden)
+
+      - options {
+          - certificate_transparency_logging_preference = "ENABLED" -> null
+        }
+    }
+
+Plan: 1 to add, 2 to change, 1 to destroy.
+```
+
+## v5.10.0 (August 31th, 2022)
+
+ENHANCEMENT:
+- Updated Ec2 Windows module to support VPC flattening by adding a default variable for subnet_type. (# [AWS4-17443](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17443))
+
+Drift Impact:
+- No
+
+## v5.9.1 (March 24th, 2022)
+BUG FIX:
+- Cert should use dns name, not hostname (# [AWS4-17279](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17279))
+
+Drift Impact:
+- Conditional: ec2_cert_required = "true"
+
+```
+  # module.ec2_win_upgrade.data.aws_iam_policy_document.acm_cert_profile_role_policy_document[0] will be read during apply
+  # (config refers to values not yet known)
+ <= data "aws_iam_policy_document" "acm_cert_profile_role_policy_document"  {
+      ~ id      = "2189511015" -> (known after apply)
+      ~ json    = jsonencode(
+            {
+              - Statement = [
+                  - {
+                      - Action   = [
+                          - "acm:RenewCertificate",
+                          - "acm:GetCertificate",
+                          - "acm:ExportCertificate",
+                          - "acm:DescribeCertificate",
+                        ]
+                      - Effect   = "Allow"
+                      - Resource = "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73"
+                      - Sid      = "RenewAndExportInstanceCertificate"
+                    },
+                ]
+              - Version   = "2012-10-17"
+            }
+        ) -> (known after apply)
+      - version = "2012-10-17" -> null
+
+      ~ statement {
+          - not_actions   = [] -> null
+          - not_resources = [] -> null
+          ~ resources     = [
+              - "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73",
+              ~ (known after apply),
+            ]
+            # (3 unchanged attributes hidden)
+        }
+    }
+
+  # module.ec2_win_upgrade.aws_ec2_tag.cert_arn[0] will be updated in-place
+  ~ resource "aws_ec2_tag" "cert_arn" {
+        id          = "i-088bc376665c99bf4,ec2_cert_arn"
+      ~ value       = "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73" -> (known after apply)
+        # (2 unchanged attributes hidden)
+    }
+
+  # module.ec2_win_upgrade.aws_iam_role_policy.acm_certificate_policy[0] will be updated in-place
+  ~ resource "aws_iam_role_policy" "acm_certificate_policy" {
+        id     = "EC2SSMDefault-***-citest1:acm-cert-***-citest1"
+        name   = "acm-cert-***-citest1"
+      ~ policy = jsonencode(
+            {
+              - Statement = [
+                  - {
+                      - Action   = [
+                          - "acm:RenewCertificate",
+                          - "acm:GetCertificate",
+                          - "acm:ExportCertificate",
+                          - "acm:DescribeCertificate",
+                        ]
+                      - Effect   = "Allow"
+                      - Resource = "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73"
+                      - Sid      = "RenewAndExportInstanceCertificate"
+                    },
+                ]
+              - Version   = "2012-10-17"
+            }
+        ) -> (known after apply)
+        # (1 unchanged attribute hidden)
+    }
+
+  # module.ec2_win_upgrade.module.private_cert[0].aws_acm_certificate.cert must be replaced
+-/+ resource "aws_acm_certificate" "cert" {
+      ~ arn                       = "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73" -> (known after apply)
+      ~ domain_name               = "citest1e.appsa.aws.alight.com" -> "citest1.appsa.aws.alight.com" # forces replacement
+      ~ domain_validation_options = [] -> (known after apply)
+      ~ id                        = "arn:aws:acm:***:686437426460:certificate/62edb76a-2acc-438d-9388-bf86ab5b0d73" -> (known after apply)
+      ~ status                    = "ISSUED" -> (known after apply)
+      ~ subject_alternative_names = [ # forces replacement
+          + "citest1.appsa.***.aws.alight.com",
+          - "citest1e.appsa.***.aws.alight.com",
+        ]
+        tags                      = {
+            "Name"                = "citest1e-tf-module-ci-test-dv"
+            "ResourceAssociation" = "ec2"
+        }
+      ~ validation_emails         = [] -> (known after apply)
+      ~ validation_method         = "NONE" -> (known after apply)
+        # (2 unchanged attributes hidden)
+
+      - options {
+          - certificate_transparency_logging_preference = "ENABLED" -> null
+        }
+    }
+Plan: 1 to add, 2 to change, 1 to destroy.
+```
+
+
+## v5.9.0 (March 13th, 2022)
+ENHANCEMENT:
+- Require IMDSv2 for fetching instance metadata. (# [AWS4-17255](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17255))
+
+Drift Impact:
+- Yes
+
+```
+# module.ec2_windows_upgrade.aws_instance.ec2[0] will be updated in-place
+  ~ resource "aws_instance" "ec2" {
+      ~ metadata_options {
+          ~ http_tokens                 = "optional" -> "required"
+            # (3 unchanged attributes hidden)
+        }
+        # (4 unchanged blocks hidden)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+## v5.8.9 (May 4th, 2022)
+ENHANCEMENT:
+- Added 2 permissions from Ec2 instances to export certificate from ACM (# [AWS4W-17251](https://alightdevelopmentandit.atlassian.net/browse/AWS4W-17215))
+
+Drift Impact:
+- yes
+
+```
+Terraform will perform the following actions:
+
+  # module.ec2_win_web.aws_iam_role_policy.acm_certificate_policy[0] will be updated in-place
+  ~ resource "aws_iam_role_policy" "acm_certificate_policy" {
+        id     = "EC2SSMDefault-***-windows1:acm-cert-***-windows1"
+        name   = "acm-cert-***-windows1"
+      ~ policy = jsonencode(
+          ~ {
+              ~ Statement = [
+                  ~ {
+                      ~ Action   = [
+                            "acm:RenewCertificate",
+                          + "acm:GetCertificate",
+                            "acm:ExportCertificate",
+                          + "acm:DescribeCertificate",
+                        ]
+                        # (3 unchanged elements hidden)
+                    },
+                ]
+                # (1 unchanged element hidden)
+            }
+        )
+        # (1 unchanged attribute hidden)
+    }
+    ```
+# module-aws-ec2-windows : changelog
+---
+## v5.9.0 (March 13th, 2022)
+ENHANCEMENT:
+- Require IMDSv2 for fetching instance metadata. (# [AWS4-17255](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17255))
+
+Drift Impact:
+- Yes
+
+```
+# module.ec2_windows_upgrade.aws_instance.ec2[0] will be updated in-place
+  ~ resource "aws_instance" "ec2" {
+      ~ metadata_options {
+          ~ http_tokens                 = "optional" -> "required"
+            # (3 unchanged attributes hidden)
+        }
+        # (4 unchanged blocks hidden)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+```
+
+## v5.8.7 (April 18th, 2022)
+ENHANCEMENT:
+- Updated backup tags, not to be created when variable is_dr = true . (# [AWS4-17178](https://alightdevelopmentandit.atlassian.net/browse/AWS2-17178))
+
+Drift Impact:
+- No
+
+## v5.8.6 (March 31st, 2022)
+ENHANCEMENT:
+- Merged clz/flz user data for flz windows puppet conversion. (# [AWS2-17217](https://alightdevelopmentandit.atlassian.net/browse/AWS2-17217))
+
+Drift Impact:
+- No
+
+## v5.8.5 (March 15th, 2022)
+ENHANCEMENT:
+- Updated MountPoint tag on ebs volumes to use correct directory when provided (# [AWS-17125](https://alightdevelopmentandit.atlassian.net/browse/AWS4-17125))
+
+Drift Impact:
+- Yes
+
+## v5.8.4 (March 1st, 2022)
+ENHANCEMENT:
+- Updated user data to apply patches to mitigate vulnerabilities. (# [AWS2-17049](https://alightdevelopmentandit.atlassian.net/browse/AWS2-17049))
+
+Drift Impact:
+- No
+
+## v5.8.3 (February 22nd, 2022)
+ENHANCEMENT:
+- Added EBS volume creation and attachment functionality (# [AWS-3996](https://jira.alight.com/browse/AWS-3996))
+
+Drift Impact:
+- Yes: Removal of volume tags will show in plan
+
+## v5.8.2 (February 14th, 2022)
+BUG FIX:
+- Fix for VPC Tier Domain Name (# [AWS-17110](https://jira.alight.com/browse/AWS-17110))
+
+Drift Impact:
+- Conditional: Dependant on the VPC Tier provided by the user
+
+## v5.8.1 (February 10th, 2022)
+BUG FIX:
+- Fix for tags (# [AWS-16272](https://jira.alight.com/browse/AWS-16272))
+
+Drift Impact:
+- None
+
+## v5.8.0 (February 2nd, 2022)
+FEATURE:
+- Added commands to send hostnames into a sqs (# [AWS-16318](https://jira.alight.com/browse/AWS-16318))
+
+Drift Impact:
+- Yes
+
+## v5.7.4 (February 1st, 2022)
+BUG FIX:
+- Bug fix for DR user data init_dr.tpl (added sysprep and updated the conditions) (# [AWS-16599](https://jira.alight.com/browse/AWS-16599))
+
+Drift Impact:
+- None
+
+## v5.7.3 (January 28th, 2022)
+ENHANCEMENT:
+- Added additional input for private cert subdomain when ELB is in a different VPC tier than the instance (# [AWS-15793](https://jira.alight.com/browse/AWS-15793))
+
+Drift Impact:
+- Conditional: Dependant on the private cert subdomain provided
+
+## v5.7.2 (January 13th, 2022)
+ENHANCEMENT:
+- Correct os-level hostname handling for v5.7.0 (# [AWS-15894](https://jira.alight.com/browse/AWS-15894) - )
+
+Drift Impact:
+- None
+
+## v5.7.1 (January 12th, 2022)
+ENHANCEMENT:
+-  root_volume_size input (# AWS-15768](https://jira.alight.com/browse/AWS-15768))
+
+Drift Impact:
+- Yes
+
+## v5.7.0 (January 5th, 2022)
+FEATURE:
+- Moved region attribute "e" (for us-east-1 ) and "w" (for us-west-2) to end vs. beginning (# [AWS-14939](https://jira.alight.com/browse/AWS-14939))
+Drift Impact:
+- Yes
+
+## v5.6.1 (December 21st, 2021)
+ENHANCEMENT:
+- README update using readme-creator modulue (# [AWS-13139](https://jira.alight.com/browse/AWS-13139))
+
+Drift Impact:
+- No
+
+## 5.6.0 (December 13th, 2021)
+FEATURE:
+- Allow users to pass in PatchAZ tag. (# [AWS-14548](https://jira.alight.com/browse/AWS-14548))
+
+Drift Impact:
+- Yes
+
+## v5.5.1 (December 8th, 2021)
+BUG FIX:
+- ec2_cert_required create policy for ec2 specific role, not default (# [AWS-14776](https://jira.alight.com/browse/AWS-14776))
+
+Drift Impact:
+- Conditional: Dependant on ec2_cert variable
+
+## v5.5.0 (December 6th, 2021)
+FEATURE:
+- Puppet -  Remove ec2 metadata trusted facts (# [AWS-14144](https://jira.alight.com/browse/AWS-14144))
+
+Drift Impact:
+- Yes
+
+## v5.4.0 (November 30th, 2021)
+FEATURE:
+- Added optional key_pair_name input (restricted to AmiVendor instances only) (# [AWS-14593](https://jira.alight.com/browse/AWS-14593))
+
+Drift Impact:
+- Conditional: Dependent on key_pair_name input for AMIVendor instances only
+
+## v5.3.0 (November 24th, 2021)
+FEATURE:
+- Added functionality to associate ACM Certificate with EC2 instance using optional variables ec2_cert_required,cert_secondary_region and cert_elb_subdomain (# [AWS-13613](https://jira.alight.com/browse/AWS-13613))
+
+Drift Impact:
+- Yes
+
+## v5.2.0 (November 10th, 2021)
+ENHANCEMENT:
+-  Base Puppet modules bootstrapping so server can connect to puppet master and apply base module/catalog. (# [AWS-13701](https://jira.alight.com/browse/AWS-13701))
+
+Drift Impact:
+- None
+
+## v5.1.2 (November 10th, 2021)
+ENHANCEMENT:
+- Updated to add Hostname, RegionalDNS, and GlobalDNS tags. (# [AWS-12045](https://jira.alight.com/browse/AWS-12045))
+
+Drift Impact:
+- Yes
+
+## v5.1.1 (November 9th, 2021)
+ENHANCEMENT:
+- Update to attach the new managed policy to the newly created IAM role (# [AWS-13428](https://jira.alight.com/browse/AWS-13428))
+
+Drift Impact:
+- Yes
+
+## v5.1.0 (October 29th, 2021)
+FEATURE:
+-  Update to create VendorAmi tag for EC2 instances that are NOT owned by Alight (# [AWS-10821](https://jira.alight.com/browse/AWS-10821))
+
+Drift Impact:
+- Yes: For instances not owned by Alight
+
+## v5.0.12 (October 12th, 2021)
+BUG FIX:
+- Update to create PatchAZ tag and value without using Terraform resource and pass correct value of (a,b, or c) (# [AWS-12352](https://jira.alight.com/browse/AWS-12352))
+
+Drift Impact:
+- Yes
